@@ -1,0 +1,53 @@
+# version: "3.9"
+
+# services:
+#   # ── MongoDB ──────────────────────────────────────────────────────────────────
+#   mongo:
+#     image: mongo:7.0
+#     container_name: vedaai-mongo
+#     restart: unless-stopped
+#     ports:
+#       - "27017:27017"
+#     volumes:
+#       - mongo_data:/data/db
+#     environment:
+#       MONGO_INITDB_DATABASE: vedaai
+#     healthcheck:
+#       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+
+#   # ── Redis ─────────────────────────────────────────────────────────────────────
+#   redis:
+#     image: redis:7.2-alpine
+#     container_name: vedaai-redis
+#     restart: unless-stopped
+#     ports:
+#       - "6379:6379"
+#     volumes:
+#       - redis_data:/data
+#     command: redis-server --appendonly yes
+#     healthcheck:
+#       test: ["CMD", "redis-cli", "ping"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+
+# volumes:
+#   mongo_data:
+#   redis_data:
+
+
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: vedaai-mongo
+    ports:
+      - "27017:27017"
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: vedaai-redis
+    ports:
+      - "6379:6379"
