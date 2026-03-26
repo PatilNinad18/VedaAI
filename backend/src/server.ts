@@ -18,8 +18,12 @@ async function bootstrap(): Promise<void> {
   await connectMongoDB();
 
   const redis = getRedisConnection();
-  await redis.ping();
-  console.log("[Redis] Ping OK");
+  try {
+    await redis.ping();
+    console.log("[Redis] Ping OK");
+  } catch (err) {
+    console.log("[Redis] Ping failed (using mock):", err.message);
+  }
 
   getGeneratePaperQueue();
 

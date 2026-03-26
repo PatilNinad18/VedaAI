@@ -9,59 +9,20 @@ import { getRedisConnection } from "../config/redis";
 let io: SocketIOServer | null = null;
 const REDIS_WS_CHANNEL = "vedaai:ws-events";
 
-function broadcastAssignmentCompletedLocal(payload: AssignmentCompletedPayload): void {
-  if (!io) return;
-
-  io.to(`assignment:${payload.assignmentId}`).emit("assignment:completed", payload);
-  io.emit("assignment:status_update", {
-    assignmentId: payload.assignmentId,
-    status: payload.status,
-    resultId: payload.resultId,
-  });
-
-  console.log(`[WebSocket] Emitted assignment:completed for ${payload.assignmentId}`);
-}
-
-function broadcastAssignmentProcessingLocal(assignmentId: string): void {
-  if (!io) return;
-
-  io.emit("assignment:status_update", {
-    assignmentId,
-    status: "processing",
-  });
-
-  console.log(`[WebSocket] Emitted assignment:processing for ${assignmentId}`);
-}
-
-function publishSocketEvent(event: {
-  type: "assignment:completed" | "assignment:status_update";
-  payload: AssignmentCompletedPayload | StatusUpdatePayload;
-}) {
-  const redis = getRedisConnection();
-  redis.publish(REDIS_WS_CHANNEL, JSON.stringify(event));
-}
-
 function handleRedisSocketEvent(message: string): void {
   try {
-    const event = JSON.parse(message) as {
-      type: "assignment:completed" | "assignment:status_update";
-      payload: AssignmentCompletedPayload | StatusUpdatePayload;
-    };
-
-    if (!event || !event.type || !event.payload) {
-      return;
-    }
+    const event = JSON.parse(message);
 
     if (event.type === "assignment:completed") {
-      broadcastAssignmentCompletedLocal(event.payload as AssignmentCompletedPayload);
+      io?.to(`assignment:${event.payload.assignmentId}`)
+        .emit("assignment:completed", event.payload);
     }
 
     if (event.type === "assignment:status_update") {
-      const payload = event.payload as StatusUpdatePayload;
-      io?.emit("assignment:status_update", payload);
+      io?.emit("assignment:status_update", event.payload);
     }
   } catch (err) {
-    console.error("[WebSocket] Failed to parse Redis socket event:", err);
+    console.error("[WebSocket] Failed to parse event:", err);
   }
 }
 
@@ -71,7 +32,6 @@ export function initSocketIO(httpServer: HTTPServer): SocketIOServer {
       origin: process.env.FRONTEND_URL || "http://localhost:3000",
       methods: ["GET", "POST"],
     },
-    transports: ["websocket", "polling"],
   });
 
   io.on("connection", (socket) => {
@@ -79,31 +39,25 @@ export function initSocketIO(httpServer: HTTPServer): SocketIOServer {
 
     socket.on("subscribe:assignment", (assignmentId: string) => {
       socket.join(`assignment:${assignmentId}`);
-      console.log(
-        `[WebSocket] Client ${socket.id} subscribed to assignment:${assignmentId}`
-      );
     });
 
-    socket.on("unsubscribe:assignment", (assignmentId: string) => {
-      socket.leave(`assignment:${assignmentId}`);
-    });
-
-    socket.on("disconnect", (reason) => {
-      console.log(`[WebSocket] Client disconnected: ${socket.id} — ${reason}`);
+    socket.on("disconnect", () => {
+      console.log(`[WebSocket] Client disconnected: ${socket.id}`);
     });
   });
 
-  const redisSubscriber = getRedisConnection().duplicate();
+  // REDIS SUBSCRIBER
+  const subscriber = getRedisConnection().duplicate();
 
-  redisSubscriber.on("error", (err) => {
-    console.error("[WebSocket] Redis subscriber error:", err.message);
+  subscriber.subscribe(REDIS_WS_CHANNEL, (err) => {
+    if (err) {
+      console.error("[WebSocket] Redis subscribe failed:", err.message);
+      return;
+    }
+    console.log(`[WebSocket] Subscribed to ${REDIS_WS_CHANNEL}`);
   });
 
-  redisSubscriber.subscribe(REDIS_WS_CHANNEL).then(() => {
-    console.log(`[WebSocket] Subscribed to Redis channel: ${REDIS_WS_CHANNEL}`);
-  });
-
-  redisSubscriber.on("message", (_channel, message) => {
+  subscriber.on("message", (_channel, message) => {
     handleRedisSocketEvent(message);
   });
 
@@ -124,29 +78,42 @@ export function emitAssignmentCompleted(
   payload: AssignmentCompletedPayload
 ): void {
   if (io) {
-    broadcastAssignmentCompletedLocal(payload);
+    io.to(`assignment:${payload.assignmentId}`).emit("assignment:completed", payload);
+    io.emit("assignment:status_update", {
+      assignmentId: payload.assignmentId,
+      status: payload.status,
+      resultId: payload.resultId,
+    });
+    console.log(`[WebSocket] Emitted assignment:completed for ${payload.assignmentId}`);
     return;
   }
 
-  publishSocketEvent({ type: "assignment:completed", payload });
-  console.log(
-    `[WebSocket] Published assignment:completed to Redis for ${payload.assignmentId}`
-  );
+  const redis = getRedisConnection();
+  redis.publish(REDIS_WS_CHANNEL, JSON.stringify({
+    type: "assignment:completed",
+    payload
+  }));
+  console.log(`[WebSocket] Published assignment:completed to Redis for ${payload.assignmentId}`);
 }
 
 export function emitAssignmentProcessing(assignmentId: string): void {
   if (io) {
-    broadcastAssignmentProcessingLocal(assignmentId);
+    io.emit("assignment:status_update", {
+      assignmentId,
+      status: "processing",
+    });
+    console.log(`[WebSocket] Emitted assignment:processing for ${assignmentId}`);
     return;
   }
 
-  publishSocketEvent({
+  const redis = getRedisConnection();
+  redis.publish(REDIS_WS_CHANNEL, JSON.stringify({
     type: "assignment:status_update",
     payload: {
       assignmentId,
       status: "processing",
     },
-  });
+  }));
 
   console.log(`[WebSocket] Published assignment:processing to Redis for ${assignmentId}`);
 }

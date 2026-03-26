@@ -1,51 +1,126 @@
 /**
  * generatePaper.worker.ts
- *
- * BullMQ Worker — runs as a SEPARATE process from the Express server.
- * Start with: `npm run worker` (or `node dist/workers/generatePaper.worker.js`)
- *
- * Responsibilities:
- * 1. Pick up jobs from the "generate-paper" queue
- * 2. Fetch the assignment from MongoDB
- * 3. Call the AI service to generate questions
- * 4. Save the Result document
- * 5. Update assignment status to "completed"
- * 6. Emit WebSocket event to notify frontend
  */
 
 import "dotenv/config";
 import { Worker, Job } from "bullmq";
-import mongoose from "mongoose";
 import { connectMongoDB } from "../config/database";
 import { getRedisConnection } from "../config/redis";
 import { Assignment } from "../models/assignment.model";
 import { Result } from "../models/result.model";
 import { generateQuestionPaper } from "../services/ai.service";
-import { emitAssignmentCompleted, emitAssignmentProcessing } from "../services/socket.service";
+import {
+  emitAssignmentCompleted,
+  emitAssignmentProcessing,
+} from "../services/socket.service";
 import type { GeneratePaperJobData } from "@veda-ai/shared";
 import { QUEUE_NAME } from "../queues/generatePaper.queue";
+import {
+  generatePaperQueue as mockQueue,
+  MockJob,
+} from "../queues/generatePaper.queue-mock";
 
-// ─── Bootstrap ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Bootstrap
+// ─────────────────────────────────────────────────────────────
 
 async function bootstrap(): Promise<void> {
   await connectMongoDB();
 
-  // Worker process does not host WebSocket server; it publishes events through Redis.
-  startWorker();
+  try {
+    startWorker();
+  } catch (err) {
+    console.error("[Worker] Failed to start BullMQ worker, using mock:", err);
+    startMockWorker();
+  }
 }
 
-// ─── Job processor ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Mock Worker (Fallback)
+// ─────────────────────────────────────────────────────────────
 
-async function processJob(job: Job<GeneratePaperJobData>): Promise<void> {
+async function startMockWorker(): Promise<void> {
+  console.log("[Worker] 🎯 Using mock worker (development mode)");
+
+  mockQueue.process(async (job: MockJob) => {
+    await processMockJob(job);
+  });
+}
+
+async function processMockJob(job: MockJob): Promise<void> {
   const { assignmentId } = job.data;
 
-  console.log(
-    `[Worker] 🚀 Job started: ${job.id} | Assignment: ${assignmentId}`
-  );
+  console.log(`[Worker] 🚀 Mock job started: ${job.id}`);
 
   try {
-    // ── Step 1: Fetch assignment ──────────────────────────────────────────────
-    console.log(`[Worker] ⏳ Fetching assignment from MongoDB...`);
+    const assignment = {
+      _id: assignmentId,
+      subject: "Mathematics",
+      className: "Grade 10",
+      questionTypes: [
+        { type: "Multiple Choice", count: 5, marks: 1 },
+        { type: "Short Answer", count: 3, marks: 2 },
+      ],
+      status: "processing",
+      save: async () => {},
+    };
+
+    await job.updateProgress(10);
+
+    const aiResult = await generateQuestionPaper({
+      subject: assignment.subject,
+      className: assignment.className,
+      questionTypes: assignment.questionTypes,
+    });
+
+    await job.updateProgress(70);
+
+    const result = {
+      _id: `result_${assignmentId}`,
+      assignmentId,
+      ...aiResult,
+      save: async () => {},
+    };
+
+    await result.save();
+
+    assignment.status = "completed";
+    await assignment.save();
+
+    emitAssignmentCompleted({
+      assignmentId,
+      resultId: result._id,
+      status: "completed",
+    });
+
+    console.log(`[Worker] ✅ Mock job completed`);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+
+    emitAssignmentCompleted({
+      assignmentId,
+      resultId: "",
+      status: "failed",
+      error: errMsg,
+    });
+
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// REAL JOB PROCESSOR
+// ─────────────────────────────────────────────────────────────
+
+async function processJob(
+  job: Job<GeneratePaperJobData>
+): Promise<void> {
+  const { assignmentId } = job.data;
+
+  console.log(`[Worker] 🚀 Job started: ${job.id}`);
+
+  try {
+    // 1. Fetch assignment
     const assignment = await Assignment.findById(assignmentId);
 
     if (!assignment) {
@@ -53,187 +128,116 @@ async function processJob(job: Job<GeneratePaperJobData>): Promise<void> {
     }
 
     if (assignment.status === "completed") {
-      console.log(
-        `[Worker] ℹ️  Assignment ${assignmentId} already completed. Skipping.`
-      );
+      console.log(`[Worker] Already completed. Skipping.`);
       return;
     }
 
-    // ── Step 2: Mark as processing ────────────────────────────────────────────
-    console.log(`[Worker] 🔄 Marking assignment as "processing"...`);
+    // 2. Mark processing
     assignment.status = "processing";
     await assignment.save();
 
     emitAssignmentProcessing(assignmentId);
     await job.updateProgress(10);
-    console.log(`[Worker] ✓ Status updated to "processing"`);
 
-    // ── Step 3: Generate question paper via AI ────────────────────────────────
-    console.log(`[Worker] 🤖 Calling AI service...`);
-    console.log(`[Worker]   Subject: ${assignment.subject}`);
-    console.log(`[Worker]   Class: ${assignment.className}`);
-    console.log(
-      `[Worker]   Question types: ${assignment.questionTypes
-        .map((qt) => `${qt.count} ${qt.type}`)
-        .join(", ")}`
-    );
-
+    // 3. Generate paper
     const aiResult = await generateQuestionPaper({
-      questionTypes: assignment.questionTypes,
-      instructions: assignment.instructions,
       subject: assignment.subject,
       className: assignment.className,
+      questionTypes: assignment.questionTypes,
     });
 
-    console.log(
-      `[Worker] ✓ AI response received: ${aiResult.sections.length} sections`
-    );
     await job.updateProgress(70);
 
-    // Log section details
-    aiResult.sections.forEach((section, i) => {
-      console.log(
-        `[Worker]   Section ${i + 1}: ${section.title} (${section.questions.length} questions)`
-      );
-    });
-
-    // ── Step 4: Save Result to MongoDB ────────────────────────────────────────
-    console.log(`[Worker] 💾 Saving result to MongoDB...`);
+    // 4. Save result
     const result = new Result({
-      assignmentId: new mongoose.Types.ObjectId(assignmentId),
-      sections: aiResult.sections,
+      assignmentId,
+      ...aiResult,
     });
 
     await result.save();
-    console.log(`[Worker] ✓ Result saved: ${result._id}`);
-    await job.updateProgress(85);
 
-    // ── Step 5: Update Assignment status + link result ────────────────────────
-    console.log(`[Worker] 📝 Updating assignment record...`);
+    // 5. Update assignment
     assignment.status = "completed";
-    assignment.resultId = result._id as mongoose.Types.ObjectId;
+    assignment.resultId = result._id;
     await assignment.save();
 
-    await job.updateProgress(95);
-    console.log(`[Worker] ✓ Assignment marked as "completed"`);
-
-    // ── Step 6: Emit WebSocket event ──────────────────────────────────────────
-    console.log(
-      `[Worker] 📡 Emitting WebSocket event to notify frontend...`
-    );
+    // 6. Notify frontend
     emitAssignmentCompleted({
       assignmentId,
-      resultId: result._id.toString(),
+      resultId: result._id,
       status: "completed",
     });
 
-    await job.updateProgress(100);
-    console.log(
-      `[Worker] ✅ Job completed successfully! Result ID: ${result._id}`
-    );
+    console.log(`[Worker] ✅ Job completed`);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    console.error(
-      `[Worker] ❌ Job failed: ${job.id} | Error: ${errMsg}`
-    );
+
+    console.error(`[Worker] ❌ Job failed: ${errMsg}`);
 
     try {
-      // Update assignment status to failed
       await Assignment.findByIdAndUpdate(assignmentId, {
         status: "failed",
       });
-      console.log(`[Worker] 📝 Updated assignment status to "failed"`);
 
-      // Emit failure event
       emitAssignmentCompleted({
         assignmentId,
         resultId: "",
         status: "failed",
         error: errMsg,
       });
-      console.log(`[Worker] 📡 Emitted failure event to frontend`);
     } catch (updateErr) {
-      console.error("[Worker] Failed to update assignment status:", updateErr);
+      console.error("[Worker] Failure handling error:", updateErr);
     }
 
     throw err;
   }
 }
 
-// ─── Worker setup ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Worker Setup
+// ─────────────────────────────────────────────────────────────
 
-function startWorker(): Worker<GeneratePaperJobData> {
+function startWorker(): void {
   const worker = new Worker<GeneratePaperJobData>(
     QUEUE_NAME,
     processJob,
     {
       connection: getRedisConnection() as any,
-      concurrency: 3, // Process up to 3 jobs simultaneously
+      prefix : "veda-ai",
+      concurrency: 3,
       limiter: {
         max: 10,
-        duration: 60000, // Max 10 jobs per minute (respect AI rate limits)
+        duration: 60000,
       },
     }
   );
 
-  worker.on("active", (job) => {
-    console.log(`[Worker] ▶️  Job ${job.id} is active`);
-  });
-
-  worker.on("completed", (job) => {
-    console.log(`[Worker] ✅ Job ${job.id} completed successfully`);
-  });
-
-  worker.on("failed", async (job, err) => {
-    console.error(
-      `[Worker] ❌ Job ${job?.id} failed: ${err?.message}`
-    );
-
-    if (job?.data.assignmentId) {
-      try {
-        await Assignment.findByIdAndUpdate(job.data.assignmentId, {
-          status: "failed",
-        });
-
-        emitAssignmentCompleted({
-          assignmentId: job.data.assignmentId,
-          resultId: "",
-          status: "failed",
-          error: err?.message || "Unknown error",
-        });
-
-        console.log(
-          `[Worker] 📡 Emitted failure notification for ${job.data.assignmentId}`
-        );
-      } catch (updateErr) {
-        console.error("[Worker] Failed to handle failure:", updateErr);
-      }
-    }
-  });
-
   worker.on("error", (err) => {
-    console.error("[Worker] ⚠️  Worker error:", err.message);
+    console.error("[Worker] ⚠️ Worker error:", err.message);
   });
 
-  console.log(`[Worker] 🎯 Worker listening on queue: "${QUEUE_NAME}"`);
-  return worker;
+  console.log(`[Worker] 🎯 Worker listening on "${QUEUE_NAME}"`);
 }
 
-// ─── Graceful shutdown ────────────────────────────────────────────────────────
-
-process.on("SIGTERM", async () => {
-  console.log("[Worker] SIGTERM received. Graceful shutdown...");
-  process.exit(0);
-});
-
-process.on("SIGINT", async () => {
-  console.log("[Worker] SIGINT received. Graceful shutdown...");
-  process.exit(0);
-});
-
-// ─── Start ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Start
+// ─────────────────────────────────────────────────────────────
 
 bootstrap().catch((err) => {
-  console.error("[Worker] Bootstrap failed:", err);
+  console.error("[Worker] Failed to start:", err);
   process.exit(1);
+});
+
+// ─────────────────────────────────────────────────────────────
+// Graceful Shutdown
+// ─────────────────────────────────────────────────────────────
+
+process.on("SIGTERM", () => {
+  console.log("[Worker] SIGTERM received");
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  console.log("[Worker] SIGINT received");
+  process.exit(0);
 });

@@ -1,5 +1,4 @@
 import { Queue, QueueEvents } from "bullmq";
-import { getRedisConnection } from "../config/redis";
 import type { GeneratePaperJobData } from "@veda-ai/shared";
 
 export const QUEUE_NAME = "generate-paper";
@@ -9,15 +8,15 @@ const DEFAULT_JOB_OPTIONS = {
   attempts: 3,
   backoff: {
     type: "exponential" as const,
-    delay: 3000, // 3s, 6s, 12s
+    delay: 3000,
   },
   removeOnComplete: {
-    count: 100, // Keep last 100 completed jobs
-    age: 60 * 60 * 24, // 24 hours
+    count: 100,
+    age: 60 * 60 * 24,
   },
   removeOnFail: {
     count: 50,
-    age: 60 * 60 * 24 * 7, // 7 days
+    age: 60 * 60 * 24 * 7,
   },
 };
 
@@ -26,7 +25,12 @@ let queueInstance: Queue | null = null;
 export function getGeneratePaperQueue(): Queue {
   if (!queueInstance) {
     queueInstance = new Queue(QUEUE_NAME, {
-      connection: getRedisConnection() as any,
+      connection: {
+        host: "127.0.0.1",
+        port: 6379,
+        maxRetriesPerRequest: null,
+      },
+      prefix: "veda-ai",
       defaultJobOptions: DEFAULT_JOB_OPTIONS,
     });
 
@@ -46,9 +50,15 @@ let queueEventsInstance: QueueEvents | null = null;
 export function getQueueEvents(): QueueEvents {
   if (!queueEventsInstance) {
     queueEventsInstance = new QueueEvents(QUEUE_NAME, {
-      connection: getRedisConnection() as any,
+      connection: {
+        host: "127.0.0.1",
+        port: 6379,
+        maxRetriesPerRequest: null,
+      },
+      prefix: "veda-ai",
     });
   }
+
   return queueEventsInstance;
 }
 
@@ -61,7 +71,7 @@ export async function addGeneratePaperJob(
     "generate-paper",
     { assignmentId },
     {
-      jobId: `assignment-${assignmentId}`, // Deduplicate: one job per assignment
+      jobId: `assignment-${assignmentId}`,
     }
   );
 
